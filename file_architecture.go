@@ -51,6 +51,12 @@ type (
 		// If not provided or equal to AttentionHeadCount,
 		// the model does not use Grouped-Query-Attention.
 		AttentionHeadCountKV uint64 `json:"attentionHeadCountKV,omitempty"`
+		// AttentionHeadCountKVs is the per-layer AttentionHeadCountKV,
+		// when the file declares "<architecture>.attention.head_count_kv" as an array.
+		//
+		// A layer with zero KV heads holds no KV cache: it is a recurrent (or attention-free) layer,
+		// see https://github.com/ggml-org/llama.cpp/blob/16d222fc5f2c0fdc3d0180e0b772516ec6e2eddd/src/models/lfm2.cpp#L9-L11.
+		AttentionHeadCountKVs []uint64 `json:"attentionHeadCountKVs,omitempty"`
 		// AttentionSlidingWindowPattern is the pattern used in the sliding window attention.
 		//
 		// 0 means all layers are Sliding Window Attention.
@@ -136,6 +142,10 @@ type (
 		SSMTimeStepRank uint32 `json:"ssmTimeStepRank,omitempty"`
 		// SSMGroupCount is the number of groups in the SSM and similar architectures.
 		SSMGroupCount uint32 `json:"ssmGroupCount,omitempty"`
+		// ShortConvLCache is the cache length of the short convolution used in LFM2 and similar architectures.
+		ShortConvLCache uint32 `json:"shortConvLCache,omitempty"`
+		// KDAHeadDim is the head dimension of the KDA(Kimi Delta Attention) used in Kimi-Linear and similar architectures.
+		KDAHeadDim uint32 `json:"kdaHeadDim,omitempty"`
 		// WKVHeadSize is the size of the head in RWKV and similar architectures.
 		RWKVHeadSize uint32 `json:"rwkvHeadSize,omitempty"`
 		// RWKVRescaleEveryNLayers is the number of layers after which the rescaling is applied in RWKV and similar architectures.
@@ -338,6 +348,19 @@ func (ga GGUFArchitecture) interleavesFullAttention() bool {
 	return ga.AttentionHybrid && ga.FullAttentionInterval > 1
 }
 
+// interleavesKVHeads returns true if the architecture is hybrid and declares which of its layers
+// are recurrent with zero entries in its per-layer attention.head_count_kv,
+// see https://github.com/ggml-org/llama.cpp/blob/16d222fc5f2c0fdc3d0180e0b772516ec6e2eddd/src/models/kimi-linear.cpp#L15-L19.
+func (ga GGUFArchitecture) interleavesKVHeads() bool {
+	return ga.AttentionHybrid && slices.Contains(ga.AttentionHeadCountKVs, 0)
+}
+
+// interleavesAttention returns true if the architecture declares which of its layers are
+// full (self-)attention and which are recurrent.
+func (ga GGUFArchitecture) interleavesAttention() bool {
+	return ga.interleavesFullAttention() || ga.interleavesKVHeads()
+}
+
 // memoryKindOfLayer returns whether the layer at the given index holds a full (self-)attention KV cache,
 // and whether it holds a recurrent (conv + ssm) state.
 //
@@ -346,6 +369,9 @@ func (ga GGUFArchitecture) interleavesFullAttention() bool {
 // see https://github.com/ggml-org/llama.cpp/blob/272700b360944e40816a7ea13da8cd723119000a/src/llama-model.cpp#L2176-L2182.
 func (ga GGUFArchitecture) memoryKindOfLayer(i uint64) (fullAttention, recurrent bool) {
 	switch {
+	case ga.interleavesKVHeads():
+		fullAttention = i < uint64(len(ga.AttentionHeadCountKVs)) && ga.AttentionHeadCountKVs[i] > 0
+		return fullAttention, !fullAttention
 	case ga.interleavesFullAttention():
 		fullAttention = (i+1)%uint64(ga.FullAttentionInterval) == 0
 		return fullAttention, !fullAttention
@@ -912,6 +938,9 @@ func (gf *GGUFFile) transformerArchitecture(arch string) (ga GGUFArchitecture) {
 		ssmTimeStepRankKey      = arch + ".ssm.time_step_rank"
 		ssmGroupCountKey        = arch + ".ssm.group_count"
 
+		shortConvLCacheKey = arch + ".shortconv.l_cache"
+		kdaHeadDimKey      = arch + ".kda.head_dim"
+
 		rwkvHeadSizeKey                = arch + ".wkv.head_size"
 		rwkvRescaleEveryNLayersKey     = arch + ".rescale_every_n_layers"
 		rwkvTimeMixExtraDimensionKey   = arch + ".time_mix_extra_dim"
@@ -966,6 +995,8 @@ func (gf *GGUFFile) transformerArchitecture(arch string) (ga GGUFArchitecture) {
 		ssmStateSizeKey,
 		ssmTimeStepRankKey,
 		ssmGroupCountKey,
+		shortConvLCacheKey,
+		kdaHeadDimKey,
 		rwkvHeadSizeKey,
 		rwkvRescaleEveryNLayersKey,
 		rwkvTimeMixExtraDimensionKey,
@@ -1021,7 +1052,12 @@ func (gf *GGUFFile) transformerArchitecture(arch string) (ga GGUFArchitecture) {
 	}
 	if v, ok := m[attentionHeadCountKVKey]; ok {
 		if v.ValueType == GGUFMetadataValueTypeArray {
-			ga.AttentionHeadCountKV = ValuesNumeric[uint64](v.ValueArray())[0]
+			// Keep the per-layer values: a hybrid architecture declares its recurrent layers
+			// with zero KV heads, and a variable-GQA architecture varies the width per layer.
+			ga.AttentionHeadCountKVs = ValuesNumeric[uint64](v.ValueArray())
+			if len(ga.AttentionHeadCountKVs) > 0 {
+				ga.AttentionHeadCountKV = slices.Max(ga.AttentionHeadCountKVs)
+			}
 		} else {
 			ga.AttentionHeadCountKV = ValueNumeric[uint64](v)
 		}
@@ -1118,10 +1154,9 @@ func (gf *GGUFFile) transformerArchitecture(arch string) (ga GGUFArchitecture) {
 	}
 	// Fall back to the hardcoded list for the hybrid architectures declaring no interval,
 	// see https://github.com/ggml-org/llama.cpp/blob/a57d1bcb3c0165ac87b1f0dbb429839b0da69689/src/llama-arch.cpp#L2029-L2038.
-	// TODO(thxCode): drop the remaining entries once their interleaving can be read as well.
-	// Falcon-H1 has none to read, it runs attention and recurrence in parallel on every layer.
-	// Jamba and Granite-Hybrid declare theirs per layer in `<architecture>.attention.head_count_kv`,
-	// which needs AttentionHeadCountKV above to become per layer as well.
+	// Jamba and Granite-Hybrid declare their interleaving per layer in
+	// `<architecture>.attention.head_count_kv`, see interleavesKVHeads.
+	// Falcon-H1 declares none, it runs attention and recurrence in parallel on every layer.
 	ga.AttentionHybrid = ga.FullAttentionInterval > 1 || slices.Contains([]string{
 		"jamba",
 		"falcon-h1",
@@ -1186,6 +1221,13 @@ func (gf *GGUFFile) transformerArchitecture(arch string) (ga GGUFArchitecture) {
 		ga.SSMGroupCount = ValueNumeric[uint32](v)
 	}
 
+	if v, ok := m[shortConvLCacheKey]; ok {
+		ga.ShortConvLCache = ValueNumeric[uint32](v)
+	}
+	if v, ok := m[kdaHeadDimKey]; ok {
+		ga.KDAHeadDim = ValueNumeric[uint32](v)
+	}
+
 	if v, ok := m[rwkvHeadSizeKey]; ok {
 		ga.RWKVHeadSize = ValueNumeric[uint32](v)
 	}
@@ -1202,6 +1244,19 @@ func (gf *GGUFFile) transformerArchitecture(arch string) (ga GGUFArchitecture) {
 		ga.RWKVTokenShiftCount = ValueNumeric[uint32](v)
 	} else if ga.AttentionRecurrent {
 		ga.RWKVTokenShiftCount = 2
+	}
+
+	// A per-layer head_count_kv with zero entries declares the interleaving as well:
+	// the zero layers hold the recurrent state, the other layers a full (self-)attention KV cache,
+	// see https://github.com/ggml-org/llama.cpp/blob/16d222fc5f2c0fdc3d0180e0b772516ec6e2eddd/src/models/lfm2.cpp#L9-L11
+	// and https://github.com/ggml-org/llama.cpp/blob/16d222fc5f2c0fdc3d0180e0b772516ec6e2eddd/src/models/kimi-linear.cpp#L15-L19.
+	// The zero layers of a stateless architecture (Deci-style dummy blocks) are attention-free
+	// instead, so becoming hybrid requires a recurrent state.
+	if hasRecurrentState := ga.SSMConvolutionKernel > 0 || ga.SSMStateSize > 0 ||
+		ga.ShortConvLCache > 0 || ga.KDAHeadDim > 0 || ga.RWKVHeadSize > 0; hasRecurrentState &&
+		!ga.AttentionRecurrent && slices.Contains(ga.AttentionHeadCountKVs, 0) {
+		ga.AttentionHybrid = true
+		ga.AttentionRecurrent = true
 	}
 
 	if v, ok := m[vocabularyLengthKey]; ok {
