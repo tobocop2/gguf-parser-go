@@ -459,3 +459,51 @@ func TestGGUFFile_EstimateLLaMACppRun_PerLayerKVHeadsKVCache(t *testing.T) {
 		t.Errorf("KV cache without offloading: got %s, want %s", hosted.Devices[0].KVCache.Sum(), GGUFBytesScalar(got))
 	}
 }
+
+func TestGGUFFile_EstimateLLaMACppRun_SlidingWindowKVCache(t *testing.T) {
+	ctx := context.Background()
+
+	const mib = 1 << 20
+	cases := []struct {
+		name string
+		repo string
+		file string
+
+		// kvCacheMin/kvCacheMax bound the KV cache of the fully offloaded device
+		// at a context of 32768 with the default f16 cache.
+		kvCacheMin, kvCacheMax uint64
+	}{
+		{
+			// gpt-oss-20b holds a full KV cache on 12 of its 24 layers (64 MiB each at 32768)
+			// and a 128-token window on the other 12 (about 4.3 MiB each).
+			name: "gpt-oss", repo: "ggml-org/gpt-oss-20b-GGUF", file: "gpt-oss-20b-MXFP4.gguf",
+			kvCacheMin: 815 * mib, kvCacheMax: 825 * mib,
+		},
+		{
+			// gemma-3n-E4B holds a full KV cache on 4 of its first 20 layers (64 MiB each at 32768),
+			// a 512-token window on the other 16 (5 MiB each), and nothing on the remaining 15,
+			// which reuse the leading caches.
+			name: "gemma3n", repo: "ggml-org/gemma-3n-E4B-it-GGUF", file: "gemma-3n-E4B-it-Q8_0.gguf",
+			kvCacheMin: 330 * mib, kvCacheMax: 342 * mib,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := ParseGGUFFileFromHuggingFace(ctx, tc.repo, tc.file, SkipLargeMetadata())
+			if err != nil {
+				t.Fatal(err)
+				return
+			}
+			got := uint64(f.EstimateLLaMACppRun(WithLLaMACppContextSize(32768)).Devices[1].KVCache.Sum())
+			if got < tc.kvCacheMin || got > tc.kvCacheMax {
+				t.Errorf("KV cache at 32768 context: got %s, want within [%s, %s]",
+					GGUFBytesScalar(got), GGUFBytesScalar(tc.kvCacheMin), GGUFBytesScalar(tc.kvCacheMax))
+			}
+			// The full-size SWA cache option restores a full KV cache on every windowed layer.
+			full := uint64(f.EstimateLLaMACppRun(WithLLaMACppContextSize(32768), WithLLaMACppFullSizeSWACache()).Devices[1].KVCache.Sum())
+			if full <= got {
+				t.Errorf("full-size SWA cache: got %s, want more than %s", GGUFBytesScalar(full), GGUFBytesScalar(got))
+			}
+		})
+	}
+}

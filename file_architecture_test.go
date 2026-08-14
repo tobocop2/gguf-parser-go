@@ -235,3 +235,61 @@ func BenchmarkGGUFFile_Architecture(b *testing.B) {
 		_ = f.Architecture()
 	}
 }
+
+func TestGGUFFile_Architecture_SlidingWindowLayers(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		repo string
+		file string
+
+		expectedWindow      uint64
+		expectedPattern     uint32
+		expectedSWALayers   int
+		expectedKVFromStart uint32
+	}{
+		{
+			// gpt-oss declares its 128-token window but no pattern;
+			// llama.cpp interleaves it with a period of 2,
+			// see https://github.com/ggml-org/llama.cpp/blob/16d222fc5f2c0fdc3d0180e0b772516ec6e2eddd/src/models/openai-moe.cpp#L8-L12.
+			name: "gpt-oss", repo: "ggml-org/gpt-oss-20b-GGUF", file: "gpt-oss-20b-MXFP4.gguf",
+			expectedWindow: 128, expectedPattern: 2, expectedSWALayers: 12,
+		},
+		{
+			// Gemma3n windows with a period of 5, and only its first 20 layers hold a KV cache,
+			// see https://github.com/ggml-org/llama.cpp/blob/16d222fc5f2c0fdc3d0180e0b772516ec6e2eddd/src/models/gemma3n.cpp#L4-L9.
+			name: "gemma3n", repo: "ggml-org/gemma-3n-E4B-it-GGUF", file: "gemma-3n-E4B-it-Q8_0.gguf",
+			expectedWindow: 512, expectedPattern: 5, expectedSWALayers: 28, expectedKVFromStart: 20,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := ParseGGUFFileFromHuggingFace(ctx, tc.repo, tc.file, SkipLargeMetadata())
+			if err != nil {
+				t.Fatal(err)
+				return
+			}
+			a := f.Architecture()
+			if a.AttentionSlidingWindow != tc.expectedWindow {
+				t.Errorf("AttentionSlidingWindow: got %d, want %d", a.AttentionSlidingWindow, tc.expectedWindow)
+			}
+			if a.AttentionSlidingWindowPattern != tc.expectedPattern {
+				t.Errorf("AttentionSlidingWindowPattern: got %d, want %d", a.AttentionSlidingWindowPattern, tc.expectedPattern)
+			}
+			swaLayers := 0
+			for i := uint64(0); i < a.BlockCount; i++ {
+				if a.isSWALayer(i) {
+					swaLayers++
+				}
+			}
+			if swaLayers != tc.expectedSWALayers {
+				t.Errorf("sliding window layers: got %d, want %d", swaLayers, tc.expectedSWALayers)
+			}
+			if a.AttentionKVFromStartLayerCount != tc.expectedKVFromStart {
+				t.Errorf("AttentionKVFromStartLayerCount: got %d, want %d",
+					a.AttentionKVFromStartLayerCount, tc.expectedKVFromStart)
+			}
+		})
+	}
+}
