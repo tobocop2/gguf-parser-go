@@ -826,6 +826,16 @@ func (gf *GGUFFile) estimateLLaMACppRunInModel(o *_GGUFRunEstimateOptions, a *GG
 				// https://github.com/ggerganov/llama.cpp/blob/172c8256840ffd882ab9992ecedbb587d9b21f15/llama.cpp#L7000-L7007.
 				rs = o.LMCCacheValueType.RowSizeOf([]uint64{uint64(a.AttentionValueLength), nKV, a.AttentionHeadCountKV})
 				offloadAttnInc += rs
+				// A layer left on the host stages its cache a second time to cross the
+				// boundary. The branch below already charges that; this one did not, so
+				// the estimate did not move between a partial and a full offload.
+				// Measured on a GTX 1070 Ti with Qwen3-0.6B Q8_0: the real compute buffer
+				// holds one figure whenever any layer is on the host and a smaller one
+				// when none is. At context 4096 that step is 9.55 MiB against the 8.5 MiB
+				// this term contributes, and at 8192 it is 18.05 against 17.0.
+				if !zeroOffload && !fullOffload {
+					offloadAttnInc += loadAttnInc
+				}
 			} else {
 				offloadAttnInc = uint64(0)
 				for _, l := range tfLs[len(tfLs)-1].Search(regexp.MustCompile(`.*\.\d+\.attn_(norm|q|qkv|q_b)\.weight`)) {
