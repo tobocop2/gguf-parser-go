@@ -727,7 +727,7 @@ func TestGGUFFile_EstimateLLaMACppRun_SpeculatorLogitsStayOnDevice(t *testing.T)
 
 	a := f.Architecture()
 	if !a.emitsLogitsAtEveryPosition() {
-		t.Fatalf("architecture %q is not recognised as a speculator head", a.Architecture)
+		t.Fatalf("architecture %q is not recognized as a speculator head", a.Architecture)
 	}
 
 	const ctxSize, batchSize = 4096, 512
