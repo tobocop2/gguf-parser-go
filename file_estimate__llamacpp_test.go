@@ -593,3 +593,113 @@ func TestGGUFFile_EstimateLLaMACppRun_LFM2SlidingWindowKVCache(t *testing.T) {
 			GGUFBytesScalar(after), GGUFBytesScalar(before))
 	}
 }
+
+func TestGGUFFile_EstimateLLaMACppRun_OutputBufferStaysOnHost(t *testing.T) {
+	// llama_context::output_reserve allocates the logits buffer from
+	// ggml_backend_cpu_buffer_type, or from the output device's host buffer type,
+	// which is pinned system memory rather than VRAM. Offloading every layer must
+	// therefore not move that buffer onto the card. Charging it to the device
+	// reported roughly 700 MiB of VRAM that no card holds, which is enough to
+	// reject a model that fits.
+	ctx := context.Background()
+
+	f, err := ParseGGUFFileFromHuggingFace(
+		ctx,
+		"NousResearch/Hermes-2-Pro-Mistral-7B-GGUF",
+		"Hermes-2-Pro-Mistral-7B.Q5_K_M.gguf",
+		SkipLargeMetadata())
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	const ctxSize, batchSize = 4096, 512
+	a := f.Architecture()
+	// nOutputs is min(context, physical batch); the buffer is float32.
+	nOutputs := uint64(batchSize)
+	wantAtLeast := (a.EmbeddingLength + a.VocabularyLength) * nOutputs * 4
+
+	base := []GGUFRunEstimateOption{
+		WithLLaMACppContextSize(ctxSize),
+		WithLLaMACppLogicalBatchSize(batchSize),
+		WithLLaMACppPhysicalBatchSize(batchSize),
+	}
+
+	cases := []struct {
+		name   string
+		layers uint64
+	}{
+		{"at the block count", a.BlockCount},
+		{"past the block count", a.BlockCount + 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := f.EstimateLLaMACppRun(append(append([]GGUFRunEstimateOption{}, base...),
+				WithLLaMACppOffloadLayers(tc.layers))...)
+			if got := uint64(e.Devices[0].Footprint); got < wantAtLeast {
+				t.Errorf("host footprint %d is below the output buffer alone (%d): the buffer was charged to a device",
+					got, wantAtLeast)
+			}
+			// The same bytes are also reached through Computation.Output. Both
+			// belong to the host, and charging either to a device counts the
+			// logits twice.
+			if got := uint64(e.Devices[0].Computation.Output); got < wantAtLeast {
+				t.Errorf("host Computation.Output %d is below the output buffer alone (%d): the projection was charged to a device",
+					got, wantAtLeast)
+			}
+			for i, d := range e.Devices[1:] {
+				if got := uint64(d.Computation.Output); got != 0 {
+					t.Errorf("device %d carries Computation.Output %d, but logits live on the host", i+1, got)
+				}
+			}
+		})
+	}
+}
+
+func TestGGUFFile_EstimateLLaMACppRun_OutputLayerCountsWithinOffloadLayers(t *testing.T) {
+	// llama.cpp fills the card from the end and counts the output layer inside
+	// n_gpu_layers: i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0). The
+	// output layer is therefore the first thing offloaded, not the last. At
+	// --gpu-layers 1 it assigns layer n_layer_all, the output, to the device and
+	// leaves every block on the host.
+	ctx := context.Background()
+
+	f, err := ParseGGUFFileFromHuggingFace(
+		ctx,
+		"NousResearch/Hermes-2-Pro-Mistral-7B-GGUF",
+		"Hermes-2-Pro-Mistral-7B.Q5_K_M.gguf",
+		SkipLargeMetadata())
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	blocks := f.Architecture().BlockCount
+
+	cases := []struct {
+		name        string
+		layers      uint64
+		wantBlocks  uint64
+		wantOutputs bool
+	}{
+		{"zero offloads nothing", 0, 0, false},
+		{"one offloads the output layer alone", 1, 0, true},
+		{"two offloads the output layer and one block", 2, 1, true},
+		{"block count leaves one block on the host", blocks, blocks - 1, true},
+		{"one past the block count offloads everything", blocks + 1, blocks, true},
+		{"beyond that is clamped", blocks + 10, blocks, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := f.EstimateLLaMACppRun(WithLLaMACppOffloadLayers(tc.layers))
+			if e.OffloadLayers != tc.wantBlocks {
+				t.Errorf("offloaded blocks = %d, want %d", e.OffloadLayers, tc.wantBlocks)
+			}
+			// Devices[0] is the host; the output layer is on a device only when
+			// the offload reaches it.
+			onHost := e.Devices[0].HandleOutputLayer
+			if onHost == tc.wantOutputs {
+				t.Errorf("output layer on host = %v, want it on a device = %v", onHost, tc.wantOutputs)
+			}
+		})
+	}
+}
