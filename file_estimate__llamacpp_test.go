@@ -792,3 +792,41 @@ func TestGGUFFile_EstimateLLaMACppRun_RecurrentTimeMixDecay(t *testing.T) {
 		})
 	}
 }
+
+func TestGGUFFile_EstimateLLaMACppRun_ProjectorPooledPositions(t *testing.T) {
+	ctx := context.Background()
+
+	// gemma3 pools its patch grid 4x4 into one token per pooled cell, and the
+	// pooling runs after the vision transformer, so the encoder's attention is
+	// quadratic in the whole grid rather than in the projector's output tokens.
+	//
+	// Measured on an A40 with llama-server, context 4096, one sequence: the
+	// projector's own device total is its weights plus its compute buffer, in MiB.
+	f, err := ParseGGUFFileFromHuggingFace(ctx, "ggml-org/gemma-3-4b-it-GGUF", "mmproj-model-f16.gguf", SkipLargeMetadata())
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	cases := []struct {
+		name string
+		fa   bool
+		want float64
+	}{
+		{"without flash attention", false, 1943.79},
+		{"with flash attention", true, 933.04},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := []GGUFRunEstimateOption{WithLLaMACppContextSize(4096), WithParallelSize(1)}
+			if tc.fa {
+				opts = append(opts, WithFlashAttention())
+			}
+
+			got := float64(f.EstimateLLaMACppRun(opts...).SummarizeItem(false, 0, 0).VRAMs[0].NonUMA) / (1024 * 1024)
+			if got < tc.want*0.9 || got > tc.want*1.1 {
+				t.Errorf("NonUMA VRAM: got %.2f MiB, want within 10%% of the measured %.2f MiB", got, tc.want)
+			}
+		})
+	}
+}
