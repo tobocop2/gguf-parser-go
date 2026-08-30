@@ -263,7 +263,19 @@ var (
 	_LMCUpWeightRegex = regexp.MustCompile(`.*\.\d+\.ffn_up\.weight`)
 	// The compressed KV projection that marks a latent-attention graph.
 	_LMCLatentAttentionRegex = regexp.MustCompile(`.*\.\d+\.attn_kv_a_mqa\.weight`)
+	// Any transformer-layer weight tensor.
+	_LMCLayerWeightRegex = regexp.MustCompile(`.*\.\d+\..*\.weight`)
 )
+
+// _LMCBackendUnholdableArchitectures lists the architectures the CUDA backend
+// has no kernels for. llama.cpp assigns every layer of these to the CPU
+// whatever the offload asks, then the batch offload path copies each layer's
+// weights into the device compute buffer, and the graph allocator holds close
+// to the whole model at once. Checked against llama.cpp c841aeeb8; refresh
+// this set as llama.cpp gains kernels.
+var _LMCBackendUnholdableArchitectures = map[string]struct{}{
+	"nanbeige": {},
+}
 
 // estimateLLaMACppFlashComputeMoments sizes the device compute buffer of a
 // flash attention graph. The buffer peaks at one of two moments of a single
@@ -1239,6 +1251,22 @@ func (gf *GGUFFile) estimateLLaMACppRunInModel(o *_GGUFRunEstimateOptions, a *GG
 				if o.FlashAttention {
 					// The flash path stages the boundary copies inside its own moments.
 					cp = GGUFBytesScalar(max(offloadAttnInc, offloadFfnInc))
+				}
+				if _, unholdable := _LMCBackendUnholdableArchitectures[a.Architecture]; unholdable &&
+					nTokens >= _LMCOffloadOpMinBatchSize {
+					// Every layer stays on the CPU, and the batch offload path
+					// streams each layer's weights through the device compute
+					// buffer. The allocator holds close to the whole model, so
+					// the buffer floors at the summed layer weights beside the
+					// moments above. Measured on Nanbeige4.2-3B-Q4_K_M: the
+					// buffer is 1854.23 MiB at every offload depth.
+					var ws uint64
+					for _, tl := range tfLs {
+						for _, l := range tl.Search(_LMCLayerWeightRegex) {
+							ws += l.Bytes()
+						}
+					}
+					cp += GGUFBytesScalar(ws)
 				}
 				for i := range e.Devices[1:] {
 					e.Devices[i+1].Computation.Compute = cp
