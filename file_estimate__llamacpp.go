@@ -4,6 +4,7 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/gpustack/gguf-parser-go/util/anyx"
@@ -263,7 +264,41 @@ var (
 	_LMCUpWeightRegex = regexp.MustCompile(`.*\.\d+\.ffn_up\.weight`)
 	// The compressed KV projection that marks a latent-attention graph.
 	_LMCLatentAttentionRegex = regexp.MustCompile(`.*\.\d+\.attn_kv_a_mqa\.weight`)
+	// The relative attention bias that marks a KQ-biased graph (t5).
+	_LMCRelativeBiasWeightRegex = regexp.MustCompile(`.*\.\d+\.attn_rel_b\.weight`)
+	// The block index inside a tensor name.
+	_LMCBlockIndexRegex = regexp.MustCompile(`\.(\d+)\.`)
 )
+
+// searchLastBlock returns the regex's matches for the highest-numbered block
+// among the given layers. A per-block layout keeps one block per tf layer, so
+// the last layer's matches come back as they are. A prefixed family like t5
+// folds every enc block into one tf layer; there a search of the last matching
+// layer spans every block, so only the last block's tensors are kept.
+func searchLastBlock(tfLs GGUFLayerTensorInfos, re *regexp.Regexp) []GGUFTensorInfo {
+	for i := len(tfLs) - 1; i >= 0; i-- {
+		matches := tfLs[i].Search(re)
+		if len(matches) == 0 {
+			continue
+		}
+		maxBlk, blkOf := -1, make([]int, len(matches))
+		for j := range matches {
+			blkOf[j] = -1
+			if sm := _LMCBlockIndexRegex.FindStringSubmatch(matches[j].Name); sm != nil {
+				blkOf[j], _ = strconv.Atoi(sm[1])
+			}
+			maxBlk = max(maxBlk, blkOf[j])
+		}
+		out := matches[:0]
+		for j := range matches {
+			if blkOf[j] == maxBlk {
+				out = append(out, matches[j])
+			}
+		}
+		return out
+	}
+	return nil
+}
 
 // estimateLLaMACppFlashComputeMoments sizes the device compute buffer of a
 // flash attention graph. The buffer peaks at one of two moments of a single
@@ -294,6 +329,13 @@ func estimateLLaMACppFlashComputeMoments(
 			archRows += 2 * embdRow
 			break
 		}
+	}
+
+	// A host layer's K and V rows, staged a second time to cross the boundary.
+	// A memoryless graph has no cache tensors to stage; only weights cross.
+	stagedKV := attnK + attnV
+	if a.buildsMemorylessGraph() {
+		stagedKV = 0
 	}
 
 	// The largest weights of any host layer, staged on the device as split
@@ -330,7 +372,7 @@ func estimateLLaMACppFlashComputeMoments(
 	attnInc = archRows + embdRow /* l_out */ + embdRow /* norm */ + embdRow /* attn_out */ + attnQ + attnK + attnV + kqMask + faAlloc
 	if boundary {
 		// The host layer's K and V cache, staged a second time to cross the boundary.
-		attnInc += loadAttnInc + wAttnSlot + attnK + attnV
+		attnInc += loadAttnInc + wAttnSlot + stagedKV
 	}
 
 	// FFN moment: the stranded residual and Q slots, the mask, the FFN input,
@@ -344,7 +386,9 @@ func estimateLLaMACppFlashComputeMoments(
 		nFFExp := a.ExpertFeedForwardLength
 		if nFFExp == 0 {
 			// Some files do not declare <arch>.expert_feed_forward_length.
-			for _, hl := range hostLayers {
+			// Every layer counts: an interleaved mixture's block zero can be
+			// dense, and a full offload references only that block here.
+			for _, hl := range allLayers {
 				for _, l := range hl.Search(_LMCExpertUpWeightRegex) {
 					if l.NDimensions > 1 {
 						nFFExp = l.Dimensions[1]
@@ -371,7 +415,7 @@ func estimateLLaMACppFlashComputeMoments(
 			for _, slot := range []uint64{loadAttnInc, wAttnSlot, wFfnSlot, wFfnSlot} {
 				actsPhase += min(slot, act)
 			}
-			ffnInc += max(actsPhase, act /* swiglu */ +wFfnSlot+wAttnSlot+down+attnK+attnV)
+			ffnInc += max(actsPhase, act /* swiglu */ +wFfnSlot+wAttnSlot+down+stagedKV)
 		} else {
 			ffnInc += stack
 		}
@@ -416,7 +460,7 @@ func estimateLLaMACppFlashComputeMoments(
 			for _, slot := range []uint64{loadAttnInc, wAttnSlot, wFfnSlot, wFfnSlot} {
 				actsPhase += min(slot, act)
 			}
-			downMoment := act + wFfnSlot + wAttnSlot + embdRow /* ffn_out */ + attnK + attnV
+			downMoment := act + wFfnSlot + wAttnSlot + embdRow /* ffn_out */ + stagedKV
 			if !gated {
 				// Only the small down output follows, so the freed up-weight
 				// hole strands under the peak.
@@ -610,12 +654,14 @@ func (gf *GGUFFile) estimateLLaMACppRunInModel(o *_GGUFRunEstimateOptions, a *GG
 
 		e.EmbeddingOnly = true
 		o.LMCContextSize = ptr.To(ptr.Deref(o.LMCContextSize, int32(a.MaximumContextLength)))
-		// Set context size/physical batch size/logical batch size to the training context size.
+		// Cap the context size to the training context size.
 		if !isRoPECustomized {
 			o.LMCContextSize = ptr.To(min(int32(a.MaximumContextLength), *o.LMCContextSize))
 		}
-		o.LMCLogicalBatchSize = o.LMCContextSize
-		o.LMCPhysicalBatchSize = o.LMCLogicalBatchSize
+		// The batch sizes stay as configured: llama.cpp encodes in n_ubatch
+		// slices whatever the context is, and sched_reserve prices the worst
+		// graph over min(n_ctx, n_ubatch) tokens, see
+		// https://github.com/ggml-org/llama.cpp/blob/c841aeeb8/src/llama-context.cpp#L595.
 		// Reranking.
 		if _, found := gf.TensorInfos.Index([]string{"cls.bias", "cls.weight"}); found > 0 {
 			e.Reranking = true
@@ -668,6 +714,13 @@ func (gf *GGUFFile) estimateLLaMACppRunInModel(o *_GGUFRunEstimateOptions, a *GG
 		nOutputs = nTokens
 		nSeq = uint64(ptr.Deref(o.ParallelSize, 1))
 		nKV = nContext
+		if a.buildsMemorylessGraph() {
+			// A memoryless graph attends over the ubatch only: there is no KV
+			// cache, and build_attn_inp_no_cache shapes the attention mask as
+			// [n_tokens, n_tokens], see
+			// https://github.com/ggml-org/llama.cpp/blob/c841aeeb8/src/llama-graph.cpp#L2676-L2698.
+			nKV = nTokens
+		}
 
 		e.ContextSize = nContext
 	}
@@ -1125,15 +1178,29 @@ func (gf *GGUFFile) estimateLLaMACppRunInModel(o *_GGUFRunEstimateOptions, a *GG
 			}
 		} else {
 			loadAttnInc, offloadAttnInc := uint64(0), uint64(0)
-			{
+			// A memoryless graph has no KV cache rows to stage across a host
+			// boundary.
+			if !a.buildsMemorylessGraph() {
 				rs := o.LMCCacheKeyType.RowSizeOf([]uint64{uint64(a.AttentionKeyLength), nKV, a.AttentionHeadCountKV})
 				loadAttnInc = rs // k-?
 				rs = o.LMCCacheValueType.RowSizeOf([]uint64{uint64(a.AttentionValueLength), nKV, a.AttentionHeadCountKV})
 				loadAttnInc += rs // v-?
 			}
+			// A graph that adds a relative attention bias prices the quadratic
+			// attention whatever the flag says: build_attn_mha declines the
+			// flash path unless kq_b is null, see
+			// https://github.com/ggml-org/llama.cpp/blob/c841aeeb8/src/llama-graph.cpp#L2564.
+			kqBias := false
+			for _, tl := range tfLs {
+				if len(tl.Search(_LMCRelativeBiasWeightRegex)) != 0 {
+					kqBias = true
+					break
+				}
+			}
+			flashPricing := o.FlashAttention && !kqBias
 			// The non-flash path keeps sizing the offload device from ffnInc below.
 			offloadFfnInc := uint64(0)
-			if o.FlashAttention {
+			if flashPricing {
 				boundary := !fullOffload && nTokens >= _LMCOffloadOpMinBatchSize
 				hostLayers := tfLs[:min(nLoadLayers, uint64(len(tfLs)))]
 				if len(hostLayers) == 0 {
@@ -1184,7 +1251,7 @@ func (gf *GGUFFile) estimateLLaMACppRunInModel(o *_GGUFRunEstimateOptions, a *GG
 				}
 			} else {
 				offloadAttnInc = uint64(0)
-				for _, l := range tfLs[len(tfLs)-1].Search(regexp.MustCompile(`.*\.\d+\.attn_(norm|q|qkv|q_b)\.weight`)) {
+				for _, l := range searchLastBlock(tfLs, regexp.MustCompile(`.*\.\d+\.attn_(norm|q|qkv|q_b)\.weight`)) {
 					var rs uint64
 					switch {
 					default: // norm.
@@ -1215,9 +1282,16 @@ func (gf *GGUFFile) estimateLLaMACppRunInModel(o *_GGUFRunEstimateOptions, a *GG
 						offloadAttnInc += rs // kq.
 					}
 				}
+				if kqBias {
+					// build_pos_bias holds three kq-sized rows beside the kq
+					// node: the gathered bias rows, their contiguous
+					// permutation, and the biased kq sum.
+					rs := GGMLTypeF32.RowSizeOf([]uint64{nKV, nTokens, a.AttentionHeadCount})
+					offloadAttnInc += 3 * rs
+				}
 			}
 			ffnInc := uint64(0)
-			for _, l := range tfLs[len(tfLs)-1].Search(regexp.MustCompile(`.*\.\d+\.(attn_norm|ffn_norm|ffn_gate|ffn_up)\.weight`)) {
+			for _, l := range searchLastBlock(tfLs, regexp.MustCompile(`.*\.\d+\.(attn_norm|ffn_norm|ffn_gate|ffn_up)\.weight`)) {
 				rs := GGMLTypeF32.RowSizeOf([]uint64{l.Dimensions[l.NDimensions-1], nTokens})
 				ffnInc += rs
 			}
@@ -1236,14 +1310,14 @@ func (gf *GGUFFile) estimateLLaMACppRunInModel(o *_GGUFRunEstimateOptions, a *GG
 			}
 			{
 				cp := GGUFBytesScalar(max(offloadAttnInc, ffnInc))
-				if o.FlashAttention {
+				if flashPricing {
 					// The flash path stages the boundary copies inside its own moments.
 					cp = GGUFBytesScalar(max(offloadAttnInc, offloadFfnInc))
 				}
 				for i := range e.Devices[1:] {
 					e.Devices[i+1].Computation.Compute = cp
 				}
-				if !o.FlashAttention && nLoadLayers > 1 {
+				if !flashPricing && nLoadLayers > 1 {
 					for i := range e.Devices[1:] {
 						if e.Devices[i+1].Remote {
 							continue
