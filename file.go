@@ -564,11 +564,54 @@ func (gf *GGUFFile) validateMetadata() error {
 	// https://github.com/ggml-org/llama.cpp/blob/b3c3b96a139d4ef1bdec926ac17aa040981cfc5d/tools/mtmd/clip.cpp#L1255-L1278.
 	// The mmproj format that predates "clip.projector_type" carries no such key at all.
 	const architectureKey = "general.architecture"
-	if v, ok := gf.Header.MetadataKV.Get(architectureKey); ok &&
-		v.ValueType == GGUFMetadataValueTypeString && v.ValueString() == "clip" {
+	v, ok := gf.Header.MetadataKV.Get(architectureKey)
+	isClip := ok && v.ValueType == GGUFMetadataValueTypeString && v.ValueString() == "clip"
+	if isClip {
 		if _, found := gf.Header.MetadataKV.Index(_GGUFClipProjectorTypeKeys); found == 0 {
 			return fmt.Errorf("the projector declares no type under any of %v, and llama.cpp cannot load it",
 				_GGUFClipProjectorTypeKeys)
+		}
+	}
+
+	// A projector key of the wrong type, a vision projector without the sizes
+	// llama.cpp requires, or a scale factor it refuses.
+	//
+	// llama.cpp reads these keys through gguf_get_val_bool and gguf_get_val_u32,
+	// which assert the stored type, see
+	// https://github.com/ggml-org/llama.cpp/blob/c841aeeb8/ggml/src/gguf.cpp#L194.
+	// It throws when a vision projector lacks one of _GGUFClipVisionRequiredKeys,
+	// and refuses a merge factor of 0 or of 65536 and above, see
+	// https://github.com/ggml-org/llama.cpp/blob/c841aeeb8/tools/mtmd/clip.cpp#L2001-L2003.
+	// 65536 squared is 2^32, which wraps a uint32 product to zero.
+	const (
+		hasVisionEncoderKey = "clip.has_vision_encoder"
+		scaleFactorKey      = "clip.vision.projector.scale_factor"
+	)
+	if isClip {
+		// The architecture reader reads every one of these keys that is present,
+		// whatever the vision flag says, so each one must hold its type.
+		if v, ok := gf.Header.MetadataKV.Get(hasVisionEncoderKey); ok && v.ValueType != GGUFMetadataValueTypeBool {
+			return fmt.Errorf("metadata key %q holds a %v, but it must hold a bool", hasVisionEncoderKey, v.ValueType)
+		}
+		typed := make([]string, 0, len(_GGUFClipVisionRequiredKeys)+1)
+		typed = append(typed, _GGUFClipVisionRequiredKeys...)
+		typed = append(typed, scaleFactorKey)
+		for _, key := range typed {
+			if v, ok := gf.Header.MetadataKV.Get(key); ok && v.ValueType != GGUFMetadataValueTypeUint32 {
+				return fmt.Errorf("metadata key %q holds a %v, but it must hold a uint32", key, v.ValueType)
+			}
+		}
+		if v, ok := gf.Header.MetadataKV.Get(scaleFactorKey); ok {
+			if s := ValueNumeric[uint64](v); s == 0 || s >= 65536 {
+				return fmt.Errorf("the vision projector declares a scale factor of %d, but llama.cpp requires 1 to 65535", s)
+			}
+		}
+		if v, ok := gf.Header.MetadataKV.Get(hasVisionEncoderKey); ok && v.ValueBool() {
+			for _, key := range _GGUFClipVisionRequiredKeys {
+				if _, ok := gf.Header.MetadataKV.Get(key); !ok {
+					return fmt.Errorf("the vision projector declares no %q, and llama.cpp cannot load it", key)
+				}
+			}
 		}
 	}
 
